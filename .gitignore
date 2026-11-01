@@ -1,0 +1,15 @@
+# 本地产物
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+out/
+
+# 本机配置与账本（含路径与登录态线索，绝不入库）
+config.local.json
+ledger.jsonl
+*.job.local.json
+
+# 编辑器
+.vscode/
+.idea/

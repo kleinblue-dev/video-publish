@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "_comment": "复制到 ~/.video-publish/config.json 后改成你自己的路径；也可以用 install.ps1 自动探测生成。密钥/cookie 不要写进仓库。",
+  "tools": {
+    "ffprobe": "D:\\tools\\ffmpeg\\bin\\ffprobe.exe",
+    "ffmpeg": "D:\\tools\\ffmpeg\\bin\\ffmpeg.exe",
+    "biliup": "D:\\tools\\biliup\\biliup.exe",
+    "python": "C:\\Python312\\python.exe",
+    "douyin_publisher": "D:\\tools\\douyin-auto\\publish_daily.py",
+    "douyin_python": "C:\\Python312\\python.exe"
+  },
+  "bilibili": {
+    "cookies_path": "D:\\tools\\biliup\\cookies.json",
+    "proxy": "",
+    "schedule_times": ["12:00", "19:00"],
+    "tid": 231,
+    "submit": "client",
+    "timeout_sec": 900
+  },
+  "douyin": {
+    "profile_dir": "D:\\tools\\douyin-auto\\profile",
+    "shot_root": "D:\\tools\\douyin-auto\\shots",
+    "result_root": "D:\\tools\\douyin-auto",
+    "schedule_times": ["12:00", "19:00"],
+    "timeout_sec": 900
+  },
+  "ledger": "~/.video-publish/ledger.jsonl",
+  "rules": ""
+}

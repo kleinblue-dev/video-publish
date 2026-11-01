@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "_comment": "视频发布规则表：唯一事实来源。改阈值只改这里，代码里不许再写第二份。source 字段说明该数字的来源，未验证的要写未验证。",
+  "duration": {
+    "min": 20,
+    "max": 180,
+    "preferred": [44, 56],
+    "source": "GTR 07-video.md 上传前 ffprobe 校验 30-180s；pixelcat qa 门禁实测 44-56s（logs/known-issues.md 第 2 条）"
+  },
+  "fps": {
+    "min": 24,
+    "max": 60,
+    "source": "B 站/抖音均接受 24-60；本机产出 30（GTR 07-video.md）"
+  },
+  "audio": {
+    "lufs_range": [-19, -11],
+    "tp_max_db": -1.0,
+    "source": "GTR 用 loudnorm -16；pixelcat 实测 -14.9（logs/daily-20261101.md）。区间为可听性经验带，告警不阻断"
+  },
+  "asr": {
+    "cer_pass": 0.11,
+    "cer_warn": 0.13,
+    "source": "pixelcat logs/known-issues.md 第 2 条：<=0.11 放行 / 0.11-0.13 警告仍发 / >0.13 拦截"
+  },
+  "formats": {
+    "16:9": { "width": 1920, "height": 1080 },
+    "9:16": { "width": 1080, "height": 1920 }
+  },
+  "platforms": {
+    "bilibili": {
+      "formats": ["16:9"],
+      "title_max": 80,
+      "desc_max": 2000,
+      "tags_min": 1,
+      "tags_max": 10,
+      "tag_max_chars": 20,
+      "max_video_bytes": 8000000000,
+      "cover_ext": [".jpg", ".jpeg", ".png"],
+      "cover_min": [1000, 600],
+      "cover_aspect": 1.777,
+      "cover_aspect_tolerance": 0.25,
+      "tid": 231,
+      "copyright": 1,
+      "no_reprint": 1,
+      "submit": "client",
+      "min_lead_hours": 4.05,
+      "schedule_times": ["12:00", "19:00"],
+      "source": {
+        "title_max": "github-tech-radar/scripts/bilibili_upload.py preflight: len(title)>80 error",
+        "desc_max": "同上 desc>2000 error",
+        "tags": "同上 1-10 个；tag 单项长度按 B 站常规 20 字（未在本机实测）",
+        "dtime": "同上：next_slots 要求候选时间 <= now+4h5m 时跳过；biliup --dtime 说明「距离提交大于4小时」",
+        "tid": "同上 tid 必须 231（科技/计算机技术）",
+        "cover": "cover.jpg 由 GTR 产出 16:9；B 站封面最小 1146x717 为公开口径，本机按 1000x600 兜底校验（未实测拒绝阈值）"
+      }
+    },
+    "douyin": {
+      "formats": ["9:16"],
+      "title_max": 55,
+      "desc_max": 1000,
+      "tags_min": 0,
+      "tags_max": 10,
+      "tag_max_chars": 20,
+      "max_video_bytes": 4000000000,
+      "cover_ext": [".jpg", ".jpeg", ".png"],
+      "cover_min": [600, 600],
+      "cover_aspect": 0.75,
+      "cover_aspect_tolerance": 0.6,
+      "min_lead_minutes": 30,
+      "schedule_times": ["12:00", "19:00"],
+      "require_hashtags": true,
+      "source": {
+        "title_max": "抖音创作页作品描述框实测 0/1000（douyin-daily-20261101-1200-result.json progress），标题 55 字为公开口径（未在本机实测拒绝）",
+        "desc_max": "同上 0/1000",
+        "cover": "douyin-auto 上传竖封面 3:4 与横封面 4:3（publish_daily.py upload_cover）",
+        "require_hashtags": "pixelcat douyin-job.json 的 desc 尾部固定带 #话题"
+      }
+    }
+  }
+}
