@@ -63,39 +63,60 @@ planned ─────────→ submitting ──exit 0 + 回执 ID──
 ```
 
 规则：`uncertain` 只能靠 `publish.py resolve` 人工改判；`submitted` 只能靠账本指纹去重；
-任何自动重试都只允许 `failed`，且必须重跑 check。
+任何自动重试都只允许 `failed`，且必须重跑 check。并发时每个 `job × 平台` 先抢占位锁，抢不到直接退出。
+
+> 重要修正（2026-11-01 对抗验证 D3）：`dup.*` 在 `check` 里必须是 **warn**，不能是 error。
+> 否则 `submit` 在预检阶段就整条 return 1，「已提交过就跳过」「B 站已发抖音继续」这些分支全是死代码；
+> 实测后果是「A 平台成功后 B 平台失败」的任务永远无法续跑。
 
 ## 4. 五个条件怎么落到检查项
 
 | 条件 | 检查项（id） | 判定依据 |
 |---|---|---|
-| C1 | `video.exists` `video.size` `video.probe` `video.format` `video.duration` `video.fps` `video.audio` | ffprobe JSON（唯一真相）+ 规则表 |
-| C1 | `audio.loudness` `audio.true_peak` | `qa.lufs` / `qa.tp`（无则 warning：未测） |
+| C1 | `video.exists` `video.size` `video.probe` `video.dimension` `video.duration` `video.fps` `video.audio` | ffprobe JSON（唯一真相）+ 规则表 |
+| C1 | `video.decode`（仅 `--deep`） | `ffmpeg -v error -i … -f null -` 整段解码；容器头正常≠介质可解 |
+| C1 | `audio.loudness` `audio.true_peak`（`--deep` 时改测实测值并核对 `qa` 数字） | `qa.lufs` / `qa.tp`，无则 warning：未测 |
 | C1 | `asr.cer` | `qa.cer` 与阈值 0.11 放行 / 0.13 警告 / >0.13 拦 |
-| C2 | `text.title` `text.desc` `text.tags` `cover.check` `cover.dimension` | 规则表（按平台） |
+| C2 | `text.title` `text.desc` `text.tags` `text.hashtags` `cover.check` `cover.dimension` | 规则表（按平台） |
 | C2 | `ai.declaration` | job 里必须为 true；B 站走 `creation_statement.id=1`，抖音走 UI 勾选 |
-| C3 | `auth.bili.cookies` `auth.douyin.profile` | 本地文件存在 + 关键字段 + 未过期；**不发网络请求** |
-| C4 | `dup.fingerprint` | 账本里 `sha256(video) + title` 已 submitted → 直接拦 |
-| C5 | `schedule.valid` | 显式时段必须 > 现在；bilibili 必须 >4h |
+| C3 | `auth.bili.cookies` `auth.douyin.profile` `tools.*` | 本地文件存在 + 关键字段 + 未过期；**不发网络请求**；执行器缺失在预检就拦 |
+| C4 | `dup.submitted` `dup.uncertain`（warn，路由） | 账本指纹；跳过/拦在 `submit` 循环里做 |
+| C5 | `schedule.valid` | 显式时段必须 > 现在；bilibili >4h；douyin 在 [2h, 14d]；带时区的时间统一换算到 Asia/Shanghai 再显示 |
+| — | `job.targets` `config.file` `dup.ledger` | 未知平台列入 warn；坏配置/坏账本不静默 |
 
 判定级别：`error`（拦住，不投）/ `warn`（放行但打印，进回执）/ `info`（记录）。
 退出码：`0` 全过或只有 warn；`1` 有 error；`2` 配置/环境问题（doctor 失败）。
 
 ## 5. 两个平台的适配器契约
 
+> 本节的「真实」以 `references/contracts.md` 为准（2026-11-01 取证，带文件:行）。设计契约与它冲突时改本文。
+
 ### bilibili（已验证可用）
-- 工具：`biliup.exe`（本机 v0.2.4），cookie 文件 JSON。
-- 参数固定：`--submit client --tid 231 --copyright 1 --no-reprint 1 --dtime <ts> --cover <jpg> --tag a,b`
+- 工具：`biliup.exe`（本机 v0.2.4），cookie 文件 JSON（`cookie_info.cookies[]`，`expires` 是 10 位 Unix 秒）。
+- 参数固定：`--submit client --tid 231 --copyright 1 --no-reprint 1 --dtime <10位秒> --cover <jpg> --tag a,b`
   `--extra-fields {"creation_statement":{"id":1}}`（AI 声明，B 站要求的显式字段）。
-- 成功判定：进程 exit 0 **且** stdout 能解析出 `BV[0-9A-Za-z]{10}`；解析不到 BV → 记 submitted 但要醒目提示「后台核对」。
-- 失败判定：进程未启动 / 非 0 退出 → `failed`；超时或 killed → `uncertain`（**不许重试**）。
+  `--submit client` 在 0.2.4 已失效，会 WARN 后自动回退 APP 接口 —— 实测两次真实投稿都成功，保持不动。
+- 成功判定：进程 exit 0 **且** stdout 能解析出 BV；aid 在回执里是 `"aid": Number(...)`，正则必须兼容 `Number(`。
+  解析不到 BV → 记 submitted 但要醒目提示「后台核对」。
+- 失败判定：进程未启动 → `failed`；超时或非 0 退出（进程已启动）→ `uncertain`（**不许重试**）。
+- **AI 声明只认「参数已传」，不认「已生效」**：biliup 接受该参数不报错，但后台是否显示「AI 生成」没有任何自动核对；
+  发布后仍需人眼看一次。
 
 ### douyin（本机已验证可用，Playwright）
-- 工具：`D:\2006L\tools\douyin-auto\publish_daily.py --job <job.json>`（持久化 Chrome profile）。
-- job 字段：`slug/video/cover/title/desc/schedule("YYYY-MM-DD HH:MM")/shot_dir/result`。
-- 成功判定：结果 JSON 里 `success && scheduled && ai_declared` **三者同为 true**；
-  缺 `ai_declared` 算失败但**不是** uncertain（页面状态可判定：作品没发出去）。
-- 退出码 2 = 登录态问题（不可重试，先修登录）；4/5 = 页面步骤失败（可修后重跑）。
+- 工具：`douyin-auto\.venv\Scripts\python.exe publish_daily.py --job <job.json>`（持久化 Chrome profile，有头运行）。
+- job 字段：`slug/video/cover/title/desc/schedule("YYYY-MM-DD HH:MM")/shot_dir/result`；
+  发布器对 `title` 自己截断到 30 字。
+- `schedule` 必须落在 **[now+2h, now+14d]**（创作页原文「支持2小时后及14天内的定时发布」），否则平台会静默改期，本地直接拦。
+- 成功判定（缺一不可）：结果 JSON **有 `finished_at`**（证明 finally 跑完，不是硬崩）
+  ∧ `success` ∧ `scheduled` ∧ `ai_declared` ∧ `body_tail` 里出现强证据「作者声明：内容由AI生成」
+  ∧ 回执 sha256 与本地视频一致。
+- **`scheduled=true` 不代表平台按你要的时间发**：真实案例请求 00:50 被平台改成 02:30 而标志仍为 true。
+  所以必须比对 `sched_value == 请求的 schedule`；不一致时**仍记 submitted**（作品确实发出去了），
+  但回执与备注要写明真实时间 —— 标 failed 会让人重跑，反而制造两条同款。
+- 退出码（代码实际，不是文档）：`0` 成功；`2` = `no_video`（failed）或 `upload_timeout`（uncertain）；
+  `3` 无成功关键词、`4` AI 声明三轮未确认、`5` 定时设置失败、`6` 封面 dry-run 失败 → failed；
+  其他码 / 结果 JSON 无 `finished_at` → uncertain（**不是** failed，不能自动重跑）。
+- 脚本**自身没有登录态检查**：登录失效表现为「启动即崩 / 结果无 finished_at」，或用只读 `check_login.py` 前置判定。
 
 ## 6. 为什么这样能提速（可测量）
 

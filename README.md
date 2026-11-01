@@ -55,7 +55,7 @@ python publish.py resolve --job job.json --target bilibili --state submitted --n
 | 命令 | 做什么 | 副作用 |
 |---|---|---|
 | `doctor` | python / ffprobe / biliup / cookie 有效期 / 抖音登录态 / 账本可写 | 无 |
-| `check` | 五道门逐条判定；`error` 拦截，`warn` 放行并进回执 | 无（**不碰网络**） |
+| `check` | 五道门逐条判定；`error` 拦截，`warn` 放行并进回执。加 `--deep` 会**整段解码**（抓「容器完好但载荷截断」）+ ffmpeg 实测响度并核对上游 qa | 无（**不碰网络**） |
 | `plan` | 打印 B 站 biliup argv、抖音 job.json、定时换算结果 | 无 |
 | `submit` | 先跑一遍 check，全过才执行；同指纹已 submitted 直接跳过 | 真实投稿 |
 | `status` | 读 JSONL 账本 | 无 |
@@ -80,14 +80,21 @@ python publish.py resolve --job job.json --target bilibili --state submitted --n
 | 固定字段 | `tid=231`、`copyright=1`、`no_reprint=1` | 标题/简介/`#话题` 进 job |
 | AI 声明 | `--extra-fields {"creation_statement":{"id":1}}` | 页面勾选，回执必须 `ai_declared=true` |
 | 定时 | `--dtime` 必须比现在晚 **>4 小时** | `schedule` 形如 `2026-11-02 12:00` |
-| 成功判据 | 退出码 0 且 stdout 能解析出 BV 号 | `success && scheduled && ai_declared` 三者同真，且回执 sha256 与本地一致 |
+| 成功判据 | 退出码 0 且 stdout 能解析出 BV 号（aid 在回执里是 `Number(...)`，正则兼容） | `finished_at` 存在 ∧ `success` ∧ `scheduled` ∧ `ai_declared` ∧ body 里出现「作者声明：内容由AI生成」∧ 回执 sha256 与本地一致 |
+
+抖音 `scheduled=true` 只代表「定时框填了且按了 Enter」，**平台可能静默改期**（真实案例：请求 00:50，实际 02:30，标志仍 true）。
+所以定时必须在 `[now+2h, now+14d]` 内，提交后比对 `sched_value`；不一致时仍记 `submitted` 但醒目提示真实时间（标 failed 会诱导重投，反而出现两条同款）。
 
 ## 幂等与 uncertain
 
-- 指纹 = `sha256(视频) + 标题`；同一指纹已 `submitted` → 直接跳过（并给回执）。
+- 指纹 = `sha256(视频) + 标题`；同一指纹已 `submitted` → submit **直接跳过**并打印回执。
+- 预检里的 `dup.*` 只是**路由提示**（warn），不是拦截：否则「B 站已发、抖音失败」的任务一重跑就被整条拦住。
+  真正的拦截在 submit：`uncertain` 不结案不投；同 job_id 换过素材不 `--republish` 不投。
 - 进程**已启动**但超时 / 非 0 退出 / 无法判定 → `uncertain`，**永不自动重投**。
 - 只有 `failed`（进程没启动，例如工具不存在、预检失败）可以修完重跑。
 - `uncertain` 必须先到平台后台核对，再用 `resolve` 结案；账本只追加，不改历史。
+- 并发安全两道锁：每 `job × 平台` 一份**占位锁**（同一条同时只允许一个 submit 进程），
+  账本写入再串行化（Windows 的 `O_APPEND` 并发会互相覆盖丢行，实测踩过）。
 
 ## 目录
 

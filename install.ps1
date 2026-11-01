@@ -70,6 +70,9 @@ foreach ($candidate in @("E:\2006L\guichao\.venv\Scripts\python.exe", "python"))
 $douyinRoot = "D:\2006L\tools\douyin-auto"
 $douyinPublisher = Join-Path $douyinRoot "publish_daily.py"
 $douyinProfile = Join-Path $douyinRoot "profile"
+# The douyin publisher runs on douyin-auto's own venv (playwright + matching version).
+$douyinPython = Join-Path $douyinRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $douyinPython)) { $douyinPython = $python }
 
 $config = [ordered]@{
     schema = 1
@@ -79,7 +82,7 @@ $config = [ordered]@{
         biliup           = $biliup
         python           = $python
         douyin_publisher = $(if (Test-Path $douyinPublisher) { $douyinPublisher } else { "" })
-        douyin_python    = $python
+        douyin_python    = $douyinPython
     }
     bilibili = [ordered]@{
         cookies_path   = $cookies
@@ -107,6 +110,7 @@ Write-Host ("  cookies    : " + $(if ($cookies)  { $cookies }  else { "(missing)
 Write-Host ("  python     : " + $(if ($python)   { $python }   else { "(missing)" }))
 Write-Host ("  douyin pub : " + $(if (Test-Path $douyinPublisher) { $douyinPublisher } else { "(missing)" }))
 Write-Host ("  douyin prof: " + $(if (Test-Path $douyinProfile)   { $douyinProfile }   else { "(missing)" }))
+Write-Host ("  douyin py  : " + $douyinPython)
 
 if ((Test-Path $ConfigPath) -and -not $Force) {
     Write-Host ""

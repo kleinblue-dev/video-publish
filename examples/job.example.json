@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "job_id": "daily-20261102-1900",
+  "video": {
+    "16:9": "D:\\path\\to\\daily-20261102-1900-16x9.mp4",
+    "9:16": "D:\\path\\to\\daily-20261102-1900-9x16.mp4"
+  },
+  "cover": {
+    "16:9": "D:\\path\\to\\cover-16x9.jpg",
+    "9:16": "D:\\path\\to\\cover-3x4.png"
+  },
+  "text": {
+    "title": "收藏两百个AI教程全没用？你漏了最关键这步",
+    "desc": "两百个AI教程，九成收藏完从没打开过。\n收藏夹塞满截图，真要用时还是懵。\n原文里提到，机制可以拆成两步。\n光存结论没用，得存下中间步骤。\n完整拆解在视频里。你觉得它还能撑多久？\n#AI #程序员 #开源项目 #技术拆解",
+    "tags": ["AI", "程序员", "开源项目", "技术拆解"],
+    "hashtags": ["#AI", "#程序员", "#开源项目", "#技术拆解"]
+  },
+  "qa": {
+    "duration": 46.633,
+    "lufs": -14.68,
+    "tp": -3.25,
+    "cer": 0.0298,
+    "verdict": "pass"
+  },
+  "targets": ["douyin", "bilibili"],
+  "schedule": {
+    "douyin": "2026-11-02 19:00",
+    "bilibili": "auto"
+  },
+  "ai_declaration": true
+}

@@ -40,11 +40,12 @@ HOME = Path(os.path.expanduser("~"))
 DEFAULT_CONFIG_PATH = HOME / ".video-publish" / "config.json"
 DEFAULT_LEDGER_PATH = HOME / ".video-publish" / "ledger.jsonl"
 
-try:  # Windows 上没有 tzdata 时退化为本机本地时间（本机就是 +08:00）
+try:  # 优先 IANA 时区；Windows 上没装 tzdata 时退化成固定 +08:00（本项目按 Asia/Shanghai 运行）
     from zoneinfo import ZoneInfo
-    TZ = ZoneInfo("Asia/Shanghai")
+    TZ = ZoneInfo(os.environ.get("VIDEO_PUBLISH_TZ", "Asia/Shanghai"))
 except Exception:  # noqa: BLE001
-    TZ = None
+    from datetime import timezone as _timezone
+    TZ = _timezone(timedelta(hours=float(os.environ.get("VIDEO_PUBLISH_TZ_OFFSET", "8"))))
 
 FORMAT_ALIASES = {
     "16:9": "16:9", "16x9": "16:9", "169": "16:9", "横屏": "16:9", "横": "16:9",
@@ -56,7 +57,9 @@ SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
-AID_RE = re.compile(r'"aid"\s*:\s*(\d+)')
+# 真实回执里是 `"aid": Number(117536561633327)`（biliup 0.2.4）；
+# 老脚本 `"aid"\s*:\s*(\d+)` 永远匹配不到 → aid 恒 None（references/contracts.md §1.3）。
+AID_RE = re.compile(r'"aid"\s*:\s*(?:Number\()?(\d+)')
 
 
 # --------------------------------------------------------------------------
@@ -252,6 +255,13 @@ def builtin_config() -> dict:
                 cookies = str(candidate)
                 break
     douyin_root = Path("D:/2006L/tools/douyin-auto")
+    # 抖音发布链路的生产解释器是 douyin-auto 自己的 venv（有 playwright），不是随便一个 python。
+    douyin_python = sys.executable
+    for candidate in (douyin_root / ".venv" / "Scripts" / "python.exe",
+                      Path("E:/2006L/guichao/.venv/Scripts/python.exe")):
+        if candidate.exists():
+            douyin_python = str(candidate)
+            break
     return {
         "schema": SCHEMA,
         "tools": {
@@ -260,8 +270,7 @@ def builtin_config() -> dict:
             "biliup": biliup,
             "python": sys.executable,
             "douyin_publisher": str(douyin_root / "publish_daily.py") if (douyin_root / "publish_daily.py").exists() else "",
-            "douyin_python": str(Path("E:/2006L/guichao/.venv/Scripts/python.exe"))
-            if Path("E:/2006L/guichao/.venv/Scripts/python.exe").exists() else sys.executable,
+            "douyin_python": douyin_python,
         },
         "bilibili": {
             "cookies_path": cookies,
@@ -286,12 +295,15 @@ def builtin_config() -> dict:
 def load_config(path: str | None = None) -> dict:
     base = builtin_config()
     candidate = path or os.environ.get(CONFIG_ENV) or str(DEFAULT_CONFIG_PATH)
-    override = read_json(Path(candidate), None) if Path(candidate).exists() else None
+    exists = Path(candidate).exists()
+    override = read_json(Path(candidate), None) if exists else None
     if isinstance(override, dict):
         base = deep_merge(base, override)
         base["_config_path"] = str(candidate)
     else:
         base["_config_path"] = ""
+        if exists:
+            base["_config_error"] = f"配置文件不是合法 JSON，已忽略（改用内置探测值）：{candidate}"
     return base
 
 
@@ -339,11 +351,14 @@ def load_job(path: Path) -> dict:
 
     video = raw.get("video")
     if isinstance(video, str):
-        video = {}
+        # 单个路径 = 所有目标平台都用它（按平台默认画幅登记），避免「给了路径却报没素材」。
+        video = {PLATFORM_FORMAT_DEFAULT.get(target, "16:9"): video
+                 for target in raw["targets"]} if video.strip() else {}
     raw["video"] = {norm_format(k) or k: v for k, v in (video or {}).items()}
     cover = raw.get("cover")
     if isinstance(cover, str):
-        cover = {}
+        cover = {PLATFORM_FORMAT_DEFAULT.get(target, "16:9"): cover
+                 for target in raw["targets"]} if cover.strip() else {}
     raw["cover"] = {norm_format(k) or k: v for k, v in (cover or {}).items()}
     text = raw.get("text") or {}
     raw["text"] = {
@@ -362,14 +377,20 @@ def load_job(path: Path) -> dict:
 
 
 def asset_for(job: dict, kind: str, target: str) -> tuple[str, str]:
-    """返回 (format, path)。缺省画幅按平台默认；显式给了别的画幅也接受。"""
+    """返回 (格式, 路径)。
+
+    画幅选择顺序：job.format[平台] 显式指定 > 平台默认画幅。
+    **不做静默兜底**：给 B 站找工作却只给了 9:16，就返回空路径让检查报错，
+    而不是拿竖屏素材去投横屏位（历史坑，见 references/pitfalls.md）。
+    """
     assets = job.get(kind) or {}
     default_fmt = PLATFORM_FORMAT_DEFAULT.get(target, "16:9")
-    if default_fmt in assets and assets[default_fmt]:
+    override = (job.get("format") or {}).get(target)
+    chosen = norm_format(override) if override else None
+    if chosen and assets.get(chosen):
+        return chosen, str(assets[chosen])
+    if assets.get(default_fmt):
         return default_fmt, str(assets[default_fmt])
-    for fmt, value in assets.items():
-        if value:
-            return fmt, str(value)
     return default_fmt, ""
 
 
@@ -430,6 +451,40 @@ def check(item_id: str, level: str, detail: str, platform: str = "*", target: st
     return {"id": item_id, "level": level, "detail": detail, "platform": platform, "target": target}
 
 
+def local_time(moment: datetime | None) -> datetime | None:
+    """带时区的时间统一换成本地（Asia/Shanghai）再显示/落账本，避免把 UTC 墙上时间当成本地时间。"""
+    if moment is None:
+        return None
+    if TZ and moment.tzinfo is not None:
+        return moment.astimezone(TZ)
+    return moment
+
+
+def check_tools(cfg: dict, target: str, rules: dict) -> list[dict]:
+    """执行器/解码器是否真的存在 —— 预检说「能发」，就不该在 submit 时才说工具没了。"""
+    items = []
+    ffprobe = str(cfg_get(cfg, "tools.ffprobe", "") or "")
+    if not ffprobe or not Path(ffprobe).exists():
+        items.append(check("tools.ffprobe", "error", f"ffprobe 不存在：{ffprobe or '(未配置)'}", target))
+    if target == "bilibili":
+        biliup = str(cfg_get(cfg, "tools.biliup", "") or "")
+        if not biliup or not Path(biliup).exists():
+            items.append(check("tools.biliup", "error", f"biliup 不存在：{biliup or '(未配置)'}", target))
+        cookies = str(cfg_get(cfg, "bilibili.cookies_path", "") or "")
+        if not cookies or not Path(cookies).exists():
+            items.append(check("tools.biliup", "error", f"cookie 文件不存在：{cookies or '(未配置)'}", target))
+    else:
+        publisher = str(cfg_get(cfg, "tools.douyin_publisher", "") or "")
+        if not publisher or not Path(publisher).exists():
+            items.append(check("tools.douyin_publisher", "error",
+                               f"抖音发布器不存在：{publisher or '(未配置)'}", target))
+        python = str(cfg_get(cfg, "tools.douyin_python", "") or "")
+        if not python or not Path(python).exists():
+            items.append(check("tools.douyin_publisher", "warn",
+                               f"douyin_python 不存在：{python or '(未配置)'}（会退回当前解释器）", target))
+    return items
+
+
 def check_auth_bilibili(cfg: dict, rules: dict) -> list[dict]:
     path = Path(str(cfg_get(cfg, "bilibili.cookies_path", "") or ""))
     if not path.exists():
@@ -444,7 +499,8 @@ def check_auth_bilibili(cfg: dict, rules: dict) -> list[dict]:
     if not cookies and isinstance(data.get("cookies"), list):
         cookies = data["cookies"]
     names = {str(item.get("name")) for item in cookies if isinstance(item, dict)}
-    required = {"SESSDATA", "bili_jct"}
+    # references/contracts.md §1.7：SESSDATA + bili_jct（写操作 CSRF）+ DedeUserID 缺一不可。
+    required = {"SESSDATA", "bili_jct", "DedeUserID"}
     missing = required - names
     if missing:
         return [check("auth.bilibili.cookies", "error", f"缺少关键字段：{','.join(sorted(missing))}", "bilibili")]
@@ -498,10 +554,12 @@ def check_platform_assets(job: dict, target: str, rules: dict, probes: dict) -> 
 
     expected_fmt = FORMAT_ALIASES.get(fmt, fmt)
     if expected_fmt not in (p_rules.get("formats") or [expected_fmt]):
-        add("video.format", "warn", f"{target} 默认画幅 {p_rules.get('formats')}，这份是 {expected_fmt}")
+        add("video.format", "warn",
+            f"{target} 常规画幅是 {p_rules.get('formats')}，这份显式指定为 {expected_fmt}（确认平台接受再投）")
 
     if not video:
-        add("video.exists", "error", f"没有 {target} 可用的视频文件")
+        add("video.exists", "error",
+            f"缺 {fmt} 素材：{target} 需要 {p_rules.get('formats')} 画幅的视频，job.video 里没有")
         return items
     path = Path(video)
     if not path.exists():
@@ -615,7 +673,8 @@ def check_platform_cover(job: dict, target: str, rules: dict) -> list[dict]:
         return [check("cover.ext", "error", f"封面格式 {ext} 不在 {allowed}", target)]
     size = image_size(path)
     if size is None:
-        return [check("cover.dimension", "warn", "读不出封面尺寸（格式兼容性未知）", target)]
+        # 扩展名在白名单里却读不出尺寸，基本就是坏图/截断文件 → 不许放过。
+        return [check("cover.dimension", "error", "封面读不出尺寸（文件损坏或伪装扩展名）", target)]
     width, height = size
     minimum = p_rules.get("cover_min") or [0, 0]
     if width < int(minimum[0]) or height < int(minimum[1]):
@@ -694,6 +753,101 @@ def check_qa(job: dict, rules: dict, targets: list[str]) -> list[dict]:
     return items
 
 
+def measure_loudness(ffmpeg: str, path: str, timeout: int = 600) -> tuple[dict | None, str]:
+    """用 ffmpeg loudnorm 实测响度（实测 ≈28.6x 实时：45s 片约 1.7s）。"""
+    if not ffmpeg or not Path(ffmpeg).exists():
+        return None, "ffmpeg 不存在"
+    try:
+        cp = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(path),
+             "-af", "loudnorm=print_format=json", "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"loudnorm 失败：{exc}"
+    blocks = re.findall(r"\{[^{}]*\}", cp.stderr or "")
+    if not blocks:
+        return None, "loudnorm 没有输出 JSON"
+    try:
+        payload = json.loads(blocks[-1])
+        return {"lufs": float(payload["input_i"]), "tp": float(payload["input_tp"]),
+                "lra": float(payload["input_lra"])}, ""
+    except (ValueError, KeyError) as exc:
+        return None, f"loudnorm JSON 解析失败：{exc}"
+
+
+def decode_check(ffmpeg: str, path: str, timeout: int = 900) -> tuple[bool, str]:
+    """整段解码（不是只读容器头）—— 能发现「moov 正常但载荷截断」的坏文件。
+
+    ffprobe 只读容器头，截掉尾部负载的 mp4 它照样报 45.0s；只有真的解码到底才暴露出来。
+    """
+    if not ffmpeg or not Path(ffmpeg).exists():
+        return False, "ffmpeg 不存在"
+    try:
+        cp = subprocess.run([ffmpeg, "-v", "error", "-nostats", "-i", str(path), "-f", "null", "-"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "整段解码超时"
+    except OSError as exc:
+        return False, f"ffmpeg 无法启动：{exc}"
+    errors = [line for line in (cp.stderr or "").splitlines() if line.strip()]
+    if cp.returncode != 0 or errors:
+        return False, (errors[0][:200] if errors else f"ffmpeg 退出码 {cp.returncode}")
+    return True, ""
+
+
+def check_deep_audio(job: dict, cfg: dict, rules: dict) -> list[dict]:
+    """--deep：不信上游 qa 的口头回执，直接对**每个画幅的成品**实测解码与响度，并核对上游数字。"""
+    ffmpeg = str(cfg_get(cfg, "tools.ffmpeg", "") or "")
+    videos: list[tuple[str, str]] = []
+    seen = set()
+    for target in job.get("targets") or []:
+        fmt, candidate = asset_for(job, "video", target)
+        if candidate and candidate not in seen and Path(candidate).exists():
+            seen.add(candidate)
+            videos.append((target, candidate))
+    if not videos:
+        return [check("audio.measured", "warn", "深检跳过：没有可读视频")]
+    items = []
+    measured_first = None
+    for target, video in videos:
+        ok, error = decode_check(ffmpeg, video)
+        if ok:
+            items.append(check("video.decode", "info", f"[{target}] 整段解码通过（{Path(video).name}）", target))
+        else:
+            items.append(check("video.decode", "error",
+                               f"[{target}] 整段解码失败：{error}（容器头正常但载荷坏了，平台会播到一半崩）", target))
+        measured, loud_error = measure_loudness(ffmpeg, video)
+        if measured is None:
+            items.append(check("audio.measured", "warn", f"[{target}] 深检失败：{loud_error}", target))
+            continue
+        items.append(check("audio.measured", "info",
+                           f"[{target}] 实测 {measured['lufs']:.2f} LUFS / {measured['tp']:.2f} dBTP / "
+                           f"LRA {measured['lra']:.1f} LU", target))
+        if measured_first is None:
+            measured_first = measured
+    if measured_first is not None:
+        qa = job.get("qa") or {}
+        for key, tolerance in (("lufs", 1.0), ("tp", 0.6)):
+            claimed = qa.get(key)
+            if claimed is None:
+                continue
+            try:
+                claimed = float(claimed)
+            except (TypeError, ValueError):
+                continue
+            actual = measured_first[key]
+            if abs(claimed - actual) > tolerance:
+                items.append(check("audio.evidence", "warn",
+                                   f"上游 qa.{key}={claimed:g} 与实测 {actual:g} 相差 "
+                                   f"{abs(claimed - actual):.2f}（>{tolerance}），qa 回执可能不准"))
+            else:
+                items.append(check("audio.evidence", "info",
+                                   f"上游 qa.{key} 与实测一致（差 {abs(claimed - actual):.2f}）"))
+    return items
+
+
 def build_plan(job: dict, target: str, cfg: dict, rules: dict, probes: dict) -> dict:
     p_rules = (rules.get("platforms") or {}).get(target) or {}
     fmt, video = asset_for(job, "video", target)
@@ -728,7 +882,7 @@ def build_plan(job: dict, target: str, cfg: dict, rules: dict, probes: dict) -> 
             else:
                 plan["warnings"].append("没有可用的 B 站定时时段（auto 需要配置 bilibili.schedule_times）")
         else:
-            moment = parse_time(str(schedule))
+            moment = local_time(parse_time(str(schedule)))
             if moment:
                 dtime = int(moment.timestamp())
                 plan["schedule"] = moment.strftime("%Y-%m-%d %H:%M")
@@ -765,12 +919,12 @@ def build_plan(job: dict, target: str, cfg: dict, rules: dict, probes: dict) -> 
         schedule_text = schedule
         if schedule in (None, "", "auto"):
             slots = next_slots(cfg_get(cfg, "douyin.schedule_times") or p_rules.get("schedule_times"),
-                               1, timedelta(minutes=int(p_rules.get("min_lead_minutes", 30))))
+                               1, timedelta(minutes=int(p_rules.get("min_lead_minutes", 120))))
             schedule_text = slots[0].strftime("%Y-%m-%d %H:%M") if slots else ""
             if not schedule_text:
                 plan["warnings"].append("没有可用的抖音定时时段（auto 需要配置 douyin.schedule_times）")
         else:
-            moment = parse_time(str(schedule))
+            moment = local_time(parse_time(str(schedule)))
             schedule_text = moment.strftime("%Y-%m-%d %H:%M") if moment else str(schedule)
         plan["schedule"] = schedule_text
         result_root = Path(str(cfg_get(cfg, "douyin.result_root", "") or ""))
@@ -809,19 +963,28 @@ def check_schedule(plan: dict, rules: dict) -> list[dict]:
                           f"定时 {moment:%Y-%m-%d %H:%M} 距现在不足 {lead.total_seconds() / 3600:.1f}h", target)]
         return [check("schedule.valid", "info", f"定时 {moment:%Y-%m-%d %H:%M}", target)]
     text = plan.get("schedule") or ""
-    moment = parse_time(text)
+    moment = local_time(parse_time(text))
     if not moment:
         return [check("schedule.valid", "error", f"定时时间无法解析：{text!r}", target)]
-    lead = timedelta(minutes=int(p_rules.get("min_lead_minutes", 30)))
+    lead = timedelta(minutes=int(p_rules.get("min_lead_minutes", 120)))
     if moment < now() + lead:
         return [check("schedule.valid", "error",
-                      f"定时 {moment:%Y-%m-%d %H:%M} 距现在不足 {lead.total_seconds() / 60:.0f} 分钟", target)]
+                      f"定时 {moment:%Y-%m-%d %H:%M} 距现在不足 {lead.total_seconds() / 60:.0f} 分钟"
+                      f"（抖音创作页原文：支持 2 小时后及 14 天内的定时发布）", target)]
+    max_days = int(p_rules.get("max_lead_days", 14))
+    if moment > now() + timedelta(days=max_days):
+        return [check("schedule.valid", "error",
+                      f"定时 {moment:%Y-%m-%d %H:%M} 超过 {max_days} 天上限，平台会拒绝或静默改期", target)]
     return [check("schedule.valid", "info", f"定时 {moment:%Y-%m-%d %H:%M}", target)]
 
 
 # --------------------------------------------------------------------------
 # 账本
 # --------------------------------------------------------------------------
+
+class LedgerError(RuntimeError):
+    """账本读不了 / 目录不可写。"""
+
 
 def ledger_path(cfg: dict) -> Path:
     return Path(str(cfg.get("ledger") or DEFAULT_LEDGER_PATH)).expanduser()
@@ -831,8 +994,12 @@ def read_ledger(cfg: dict) -> list[dict]:
     path = ledger_path(cfg)
     if not path.exists():
         return []
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise LedgerError(f"账本读不了：{path}（{exc}）") from exc
     entries = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -845,14 +1012,93 @@ def read_ledger(cfg: dict) -> list[dict]:
     return entries
 
 
+def _ledger_write_lock(cfg: dict, timeout: float = 5.0):
+    """串行化账本写入。Windows 的 O_APPEND 是「seek 到尾再写」，并发下会互相覆盖丢行（实测过）。"""
+    lock = ledger_path(cfg).parent / "ledger.lock"
+    deadline = time.time() + max(0.5, timeout)
+    while True:
+        try:
+            return lock, os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.time() > deadline:
+                return lock, None
+            time.sleep(0.02)
+        except OSError as exc:
+            raise LedgerError(f"账本锁建不了：{lock}（{exc}）") from exc
+
+
 def append_ledger(cfg: dict, entry: dict) -> None:
     path = ledger_path(cfg)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    entry.setdefault("ts", iso())
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise LedgerError(f"账本目录建不了：{path.parent}（{exc}）") from exc
+    lock, fd = _ledger_write_lock(cfg)
+    if fd is None:
+        raise LedgerError(f"账本被别的进程占着（{lock}），稍后重试")
+    try:
+        entry.setdefault("ts", iso())
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        raise LedgerError(f"账本写不了：{path}（{exc}）") from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def _claim_path(cfg: dict, job_id: str, target: str) -> Path:
+    safe_id = re.sub(r"[^0-9A-Za-z._-]+", "_", str(job_id))[:60] or "job"
+    return ledger_path(cfg).parent / f"claim-{safe_id}-{target}.lock"
+
+
+def acquire_claim(cfg: dict, job_id: str, target: str, ttl_seconds: int = 1800) -> tuple[Path | None, str]:
+    """原子占位：同一 job×平台同时只允许一个 submit 进程（防双投）。
+
+    O_CREAT|O_EXCL 在 Windows/Linux 上都是原子的；超过 ttl 的陈旧锁视为死进程遗留，允许抢占。
+    """
+    path = _claim_path(cfg, job_id, target)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return None, f"占位目录不可写：{path.parent}（{exc}）"
+    for attempt in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"pid": os.getpid(), "ts": iso()}, ensure_ascii=False))
+            return path, ""
+        except FileExistsError:
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                age = ttl_seconds + 1
+            if age < ttl_seconds:
+                return None, f"另一个 submit 正在投这条（占位 {age:.0f}s，>{ttl_seconds}s 才会被接管）"
+            try:
+                path.unlink()
+            except OSError as exc:
+                return None, f"陈旧占位删不掉：{path}（{exc}）"
+        except OSError as exc:
+            return None, f"占位失败：{path}（{exc}）"
+    return None, "占位竞争失败，稍后重试"
+
+
+def release_claim(path: Path | None) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
 
 
 def fingerprint(video: str, title: str) -> str:
@@ -875,18 +1121,26 @@ def latest_entry(cfg: dict, job_id: str, target: str) -> dict | None:
 
 
 def check_duplicate(cfg: dict, job: dict, target: str, fp: str) -> list[dict]:
+    """账本是「路由信息」，不是预检错误。
+
+    check 里只提示（warn），真正的拦截/跳过放在 submit 循环里：
+    否则「B 站已发、抖音失败」的任务一重跑就被整条拦死（实测踩过）。
+    """
     job_id = str(job.get("job_id"))
-    latest = latest_entry(cfg, job_id, target)
+    try:
+        latest = latest_entry(cfg, job_id, target)
+    except LedgerError as exc:
+        return [check("dup.ledger", "error", str(exc), target)]
     if latest and str(latest.get("state")) == "submitted":
         if str(latest.get("fingerprint")) == fp:
-            return [check("dup.submitted", "error",
+            return [check("dup.submitted", "warn",
                           f"这条已经投过（{latest.get('ts')}，回执 "
-                          f"{json.dumps(latest.get('receipt') or {}, ensure_ascii=False)}），不许重投", target)]
+                          f"{json.dumps(latest.get('receipt') or {}, ensure_ascii=False)}）；submit 会跳过", target)]
         return [check("dup.submitted", "warn",
-                      f"同 job_id 曾以不同素材投过（{latest.get('ts')}），请确认不是误投", target)]
+                      f"同 job_id 曾以不同素材投过（{latest.get('ts')}），确认不是误投", target)]
     if latest and str(latest.get("state")) == "uncertain":
-        return [check("dup.uncertain", "error",
-                      f"上一次结果不确定（{latest.get('ts')}），先 resolve 再投", target)]
+        return [check("dup.uncertain", "warn",
+                      f"上一次结果不确定（{latest.get('ts')}），先 resolve 再投（submit 会拦）", target)]
     if latest and str(latest.get("state")) == "submitting":
         return [check("dup.uncertain", "warn",
                       f"账本里还留着 submitting（{latest.get('ts')}），若进程已死用 resolve 结案", target)]
@@ -897,10 +1151,14 @@ def check_duplicate(cfg: dict, job: dict, target: str, fp: str) -> list[dict]:
 # 预检总入口
 # --------------------------------------------------------------------------
 
-def run_checks(job: dict, cfg: dict, rules: dict) -> list[dict]:
-    targets = [t for t in job.get("targets") or [] if t in (rules.get("platforms") or {})]
+def run_checks(job: dict, cfg: dict, rules: dict, deep: bool = False) -> list[dict]:
+    raw_targets = job.get("targets") or []
+    supported = set((rules.get("platforms") or {}).keys())
+    targets = [t for t in raw_targets if t in supported]
+    unsupported = [t for t in raw_targets if t not in supported]
     if not targets:
-        return [check("job.targets", "error", f"job.targets 里没有已支持的平台：{job.get('targets')}")]
+        return [check("job.targets", "error",
+                      f"job.targets 里没有已支持的平台（支持 {sorted(supported)}）：{raw_targets}")]
     probes: dict = {}
     ffprobe = str(cfg_get(cfg, "tools.ffprobe", "") or "")
     for target in targets:
@@ -910,8 +1168,16 @@ def run_checks(job: dict, cfg: dict, rules: dict) -> list[dict]:
     items: list[dict] = []
     items.append(check("job.schema", "info" if job.get("schema") in (None, SCHEMA) else "warn",
                        f"job_id={job.get('job_id')} targets={targets}"))
+    if unsupported:
+        items.append(check("job.targets", "warn",
+                           f"这些平台还不支持，会被忽略（不会假装发出去）：{unsupported}"))
+    if cfg.get("_config_error"):
+        items.append(check("config.file", "warn", str(cfg["_config_error"])))
     items.extend(check_qa(job, rules, targets))
+    if deep:
+        items.extend(check_deep_audio(job, cfg, rules))
     for target in targets:
+        items.extend(check_tools(cfg, target, rules))
         items.extend(check_auth_bilibili(cfg, rules) if target == "bilibili" else check_auth_douyin(cfg))
         items.extend(check_platform_assets(job, target, rules, probes))
         items.extend(check_platform_text(job, target, rules))
@@ -997,50 +1263,94 @@ def submit_bilibili(job: dict, plan: dict, cfg: dict) -> dict:
 
 
 def submit_douyin(job: dict, plan: dict, cfg: dict) -> dict:
+    """抖音三态判定，规则来自 references/contracts.md §2.5 / §4。
+
+    关键事实（实测取证）：
+    - `scheduled=true` 只代表「填了定时框 + 按了 Enter 没抛异常」，平台可能静默改期；
+      必须比对 `sched_value == 请求的 schedule`。
+    - 结果 JSON 缺 `finished_at` = finally 没跑 = 进程硬崩 → 只能 uncertain，不能当 failed 重跑。
+    - 退出码 2 有两种语义：no_video（failed）/ upload_timeout（uncertain）；脚本自己没有登录检查。
+    - `success` 只是页面正文命中关键词，必须叠加 `ai_declared` 与强文案。
+    """
     publisher = str(cfg_get(cfg, "tools.douyin_publisher", "") or "")
     if not publisher or not Path(publisher).exists():
         return {"state": "failed", "note": f"抖音发布器不存在：{publisher}", "code": None, "receipt": {}}
     douyin_job = dict(plan.get("douyin_job") or {})
-    if not douyin_job.get("schedule"):
+    requested = str(douyin_job.get("schedule") or "")
+    if not requested:
         return {"state": "failed", "note": "没有合法的抖音定时时间", "code": None, "receipt": {}}
     job_path = Path(douyin_job["result"]).with_name(f"job-{job.get('job_id')}.json")
     write_json(job_path, douyin_job)
     python = str(cfg_get(cfg, "tools.douyin_python", sys.executable))
     argv = [python, publisher, "--job", str(job_path)]
     code, output, started = run_process(argv, int(cfg_get(cfg, "douyin.timeout_sec", 900)))
-    receipt = {"job": str(job_path), "result": douyin_job["result"], "schedule": douyin_job["schedule"]}
+    receipt = {"job": str(job_path), "result": douyin_job["result"], "requested_schedule": requested}
     if not started:
         return {"state": "failed", "note": output[-300:], "code": code, "receipt": receipt}
     if code is None:
-        return {"state": "uncertain", "note": "抖音发布进程超时，先看后台再决定，别重跑",
+        return {"state": "uncertain", "note": "抖音发布进程超时，先去创作中心看有没有这条，别重跑",
                 "code": None, "receipt": receipt, "output": output[-600:]}
+
     result = read_json(Path(douyin_job["result"]), None)
+    tail = output[-600:]
     if not isinstance(result, dict):
         if code == 0:
             return {"state": "uncertain", "note": "进程退出 0 但结果 JSON 读不到，后台核对",
-                    "code": code, "receipt": receipt, "output": output[-600:]}
-        return {"state": "failed", "note": f"退出码 {code}，无结果文件", "code": code, "receipt": receipt,
-                "output": output[-600:]}
-    ok = bool(result.get("success")) and bool(result.get("scheduled")) and bool(result.get("ai_declared"))
-    receipt.update({"success": result.get("success"), "scheduled": result.get("scheduled"),
-                    "ai_declared": result.get("ai_declared"), "stage": result.get("stage"),
-                    "sha256": result.get("sha256"), "finished_at": result.get("finished_at")})
-    if ok:
-        expected = sha256_file(Path(plan["video"])) if plan.get("video") and Path(plan["video"]).exists() else ""
-        if expected and result.get("sha256") and str(result["sha256"]) != expected:
-            return {"state": "uncertain", "note": "平台回执里的 sha256 与本地视频不一致，上传的可能不是这份文件",
-                    "code": code, "receipt": receipt, "output": output[-600:]}
-        return {"state": "submitted", "note": "", "code": code, "receipt": receipt, "output": output[-600:]}
-    reasons = []
-    if not result.get("success"):
-        reasons.append("success=false")
-    if not result.get("scheduled"):
-        reasons.append("scheduled=false")
-    if not result.get("ai_declared"):
-        reasons.append("ai_declared=false")
-    hint = {2: "（登录态问题，先人工登录）", 4: "（页面步骤失败）", 5: "（页面步骤失败）"}.get(code, "")
-    return {"state": "failed", "note": f"{','.join(reasons)}{hint}", "code": code, "receipt": receipt,
-            "output": output[-600:]}
+                    "code": code, "receipt": receipt, "output": tail}
+        return {"state": "failed", "note": f"退出码 {code}，无结果文件（若是启动即崩应看 stderr）",
+                "code": code, "receipt": receipt, "output": tail}
+
+    stage = str(result.get("stage") or "")
+    body = str(result.get("body_tail") or "")
+    strong_ai = "作者声明：内容由AI生成" in body
+    sched_value = str(result.get("sched_value") or "")
+    receipt.update({
+        "stage": stage, "success": result.get("success"), "scheduled": result.get("scheduled"),
+        "ai_declared": result.get("ai_declared"), "sha256": result.get("sha256"),
+        "actual_schedule": sched_value, "finished_at": result.get("finished_at"),
+        "in_manage": result.get("in_manage"),
+    })
+
+    # 硬崩判据：finally 没跑 → 结果 JSON 没有 finished_at
+    if not result.get("finished_at"):
+        return {"state": "uncertain", "note": f"结果 JSON 没有 finished_at（stage={stage or '空'}），进程硬崩，后台核对后再定",
+                "code": code, "receipt": receipt, "output": tail}
+    if code not in (0, 2, 3, 4, 5, 6):
+        return {"state": "uncertain", "note": f"未知退出码 {code}（stage={stage}），后台核对",
+                "code": code, "receipt": receipt, "output": tail}
+    if code == 2:
+        if stage == "upload_timeout":
+            return {"state": "uncertain", "note": "上传 420s 未完成（upload_timeout），可能已上传一半，后台核对",
+                    "code": code, "receipt": receipt, "output": tail}
+        return {"state": "failed", "note": f"stage={stage or 'no_video'}（视频不存在/未开始）", "code": code,
+                "receipt": receipt, "output": tail}
+    if code in (3, 4, 5, 6):
+        reasons = {3: "页面没有任何成功关键词", 4: "AI 声明三轮未确认（作品没发出去）",
+                   5: "定时发布设置失败", 6: "封面 dry-run 失败"}.get(code, stage)
+        return {"state": "failed", "note": f"退出码 {code}：{reasons}", "code": code,
+                "receipt": receipt, "output": tail}
+
+    flags = {"success": bool(result.get("success")), "scheduled": bool(result.get("scheduled")),
+             "ai_declared": bool(result.get("ai_declared"))}
+    if not all(flags.values()):
+        missing = [name for name, value in flags.items() if not value]
+        return {"state": "failed", "note": f"{','.join(missing)}=false（页面状态可判定，未发布成功）",
+                "code": code, "receipt": receipt, "output": tail}
+    if not strong_ai:
+        return {"state": "uncertain",
+                "note": "ai_declared=true 但 body_tail 里没有「作者声明：内容由AI生成」强证据（可能误判），人工核对",
+                "code": code, "receipt": receipt, "output": tail}
+    expected = sha256_file(Path(plan["video"])) if plan.get("video") and Path(plan["video"]).exists() else ""
+    if expected and result.get("sha256") and str(result["sha256"]) != expected:
+        return {"state": "uncertain", "note": "平台回执 sha256 与本地视频不一致，上传的可能不是这份文件",
+                "code": code, "receipt": receipt, "output": tail}
+    if sched_value and requested and sched_value != requested:
+        # 作品确实发出去了（改期也一样），但不能让「定时被改」静默通过；也不标 uncertain，
+        # 否则操作者会重跑 → 出现两条同款。这里记真实时间 + 醒目备注。
+        return {"state": "submitted",
+                "note": f"⚠ 平台把定时从 {requested} 改成了 {sched_value}（已发布，勿重投；如需精确时段去后台改）",
+                "code": code, "receipt": receipt, "output": tail}
+    return {"state": "submitted", "note": "", "code": code, "receipt": receipt, "output": tail}
 
 
 # --------------------------------------------------------------------------
@@ -1076,6 +1386,10 @@ def cmd_doctor(args, cfg: dict, rules: dict) -> int:
     row("douyin.publisher", publisher.exists(), str(publisher) or "未配置")
     profile = Path(str(cfg_get(cfg, "douyin.profile_dir", "") or ""))
     row("douyin.profile", profile.exists(), str(profile))
+    ffmpeg = str(cfg_get(cfg, "tools.ffmpeg", "") or "")
+    row("ffmpeg", bool(ffmpeg) and Path(ffmpeg).exists(),
+        (ffmpeg or "找不到（--deep 实测解码/响度要用）"))
+    row("timezone", TZ is not None, getattr(TZ, "key", str(TZ)))
     ledger = ledger_path(cfg)
     try:
         ledger.parent.mkdir(parents=True, exist_ok=True)
@@ -1087,7 +1401,10 @@ def cmd_doctor(args, cfg: dict, rules: dict) -> int:
         row("ledger", False, f"{ledger}（{exc}）")
     row("rules", True, str(cfg.get("rules") or DEFAULT_RULES_PATH))
     # 没有配置文件不算故障：内置探测已能从本机已有工具推断出全部路径。
-    row("config", True, cfg.get("_config_path") or f"未找到，用内置探测值（可创建 {DEFAULT_CONFIG_PATH} 固化）")
+    if cfg.get("_config_error"):
+        row("config", False, str(cfg["_config_error"]))
+    else:
+        row("config", True, cfg.get("_config_path") or f"未找到，用内置探测值（可创建 {DEFAULT_CONFIG_PATH} 固化）")
 
     for name, mark, detail in rows:
         print(f"  {mark} {name:<18} {detail}")
@@ -1096,19 +1413,27 @@ def cmd_doctor(args, cfg: dict, rules: dict) -> int:
     return 0 if not bad else 2
 
 
+def _apply_target_arg(job: dict, raw: str) -> dict:
+    value = (raw or "").strip().lower()
+    if not value or value == "all":
+        return job
+    job["targets"] = [item.strip() for item in value.split(",") if item.strip()]
+    return job
+
+
 def cmd_check(args, cfg: dict, rules: dict) -> int:
-    job = load_job(Path(args.job))
-    if args.target:
-        job["targets"] = [t.strip().lower() for t in args.target.split(",") if t.strip()]
-    items = run_checks(job, cfg, rules)
+    job = _apply_target_arg(load_job(Path(args.job)), args.target)
+    try:
+        items = run_checks(job, cfg, rules, deep=args.deep)
+    except LedgerError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 2
     print_checks(items, as_json=args.json)
     return 0 if summarize(items)["ok"] else 1
 
 
 def cmd_plan(args, cfg: dict, rules: dict) -> int:
-    job = load_job(Path(args.job))
-    if args.target:
-        job["targets"] = [t.strip().lower() for t in args.target.split(",") if t.strip()]
+    job = _apply_target_arg(load_job(Path(args.job)), args.target)
     probes = {}
     ffprobe = str(cfg_get(cfg, "tools.ffprobe", "") or "")
     for target in job["targets"]:
@@ -1135,14 +1460,16 @@ def cmd_plan(args, cfg: dict, rules: dict) -> int:
 
 
 def cmd_submit(args, cfg: dict, rules: dict) -> int:
-    job = load_job(Path(args.job))
-    if args.target:
-        job["targets"] = [t.strip().lower() for t in args.target.split(",") if t.strip()]
+    job = _apply_target_arg(load_job(Path(args.job)), args.target)
     targets = [t for t in job["targets"] if t in (rules.get("platforms") or {})]
     if not targets:
         print("✗ job.targets 里没有已支持的平台", file=sys.stderr)
         return 1
-    items = run_checks(job, cfg, rules)
+    try:
+        items = run_checks(job, cfg, rules, deep=args.deep)
+    except LedgerError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 2
     summary = summarize(items)
     print_checks(items, as_json=args.json)
     if not summary["ok"]:
@@ -1159,27 +1486,51 @@ def cmd_submit(args, cfg: dict, rules: dict) -> int:
         plan = build_plan(job, target, cfg, rules, probes)
         _, video = asset_for(job, "video", target)
         fp = fingerprint(video, (job.get("text") or {}).get("title"))
-        previous = latest_entry(cfg, str(job.get("job_id")), target)
-        if previous and str(previous.get("state")) == "submitted" and str(previous.get("fingerprint")) == fp:
-            print(f"\n[{target}] 已提交过，跳过（回执 {json.dumps(previous.get('receipt') or {}, ensure_ascii=False)}）")
+        try:
+            previous = latest_entry(cfg, str(job.get("job_id")), target)
+        except LedgerError as exc:
+            print(f"✗ [{target}] {exc}", file=sys.stderr)
+            exit_code = 2
             continue
+        if previous and str(previous.get("state")) == "submitted":
+            if str(previous.get("fingerprint")) == fp:
+                print(f"\n[{target}] 已提交过，跳过（回执 {json.dumps(previous.get('receipt') or {}, ensure_ascii=False)}）")
+                continue
+            if not args.republish:
+                print(f"\n✗ [{target}] 同 job_id 已投过不同素材（{previous.get('ts')}）；"
+                      f"确认要重投请加 --republish", file=sys.stderr)
+                exit_code = 1
+                continue
         if previous and str(previous.get("state")) == "uncertain" and not args.force_uncertain:
-            print(f"\n✗ [{target}] 上次结果不确定，先 publish.py resolve 结案", file=sys.stderr)
+            print(f"\n✗ [{target}] 上次结果不确定，先 publish.py resolve 结案（或确认后加 --force-uncertain）",
+                  file=sys.stderr)
             exit_code = 1
             continue
         print(f"\n[{target}] 提交 → {plan['video']}")
         if args.dry_run:
             print("  DRY-RUN：不执行。命令：" + subprocess.list2cmdline([str(x) for x in plan["command"]]))
             continue
-        append_ledger(cfg, {"job_id": job.get("job_id"), "target": target, "state": "submitting",
-                            "format": plan["format"], "video": plan["video"],
-                            "fingerprint": fp, "schedule": plan.get("schedule")})
-        result = submit_bilibili(job, plan, cfg) if target == "bilibili" else submit_douyin(job, plan, cfg)
-        append_ledger(cfg, {"job_id": job.get("job_id"), "target": target, "state": result["state"],
-                            "format": plan["format"], "video": plan["video"], "fingerprint": fp,
-                            "schedule": plan.get("schedule"), "note": result.get("note", ""),
-                            "code": result.get("code"), "receipt": result.get("receipt") or {},
-                            "output_tail": result.get("output", "") if args.verbose else ""})
+        claim, claim_error = acquire_claim(cfg, str(job.get("job_id")), target)
+        if claim is None:
+            print(f"\n✗ [{target}] {claim_error}", file=sys.stderr)
+            exit_code = 1
+            continue
+        try:
+            append_ledger(cfg, {"job_id": job.get("job_id"), "target": target, "state": "submitting",
+                                "format": plan["format"], "video": plan["video"],
+                                "fingerprint": fp, "schedule": plan.get("schedule")})
+            result = submit_bilibili(job, plan, cfg) if target == "bilibili" else submit_douyin(job, plan, cfg)
+            append_ledger(cfg, {"job_id": job.get("job_id"), "target": target, "state": result["state"],
+                                "format": plan["format"], "video": plan["video"], "fingerprint": fp,
+                                "schedule": plan.get("schedule"), "note": result.get("note", ""),
+                                "code": result.get("code"), "receipt": result.get("receipt") or {},
+                                "output_tail": result.get("output", "") if args.verbose else ""})
+        except LedgerError as exc:
+            print(f"✗ [{target}] 账本写入失败：{exc}", file=sys.stderr)
+            exit_code = 2
+            continue
+        finally:
+            release_claim(claim)
         mark = {"submitted": "✓", "failed": "✗", "uncertain": "!"}.get(result["state"], "?")
         print(f"  {mark} {result['state']}  {result.get('note') or ''}")
         if result.get("receipt"):
@@ -1192,7 +1543,11 @@ def cmd_submit(args, cfg: dict, rules: dict) -> int:
 
 
 def cmd_status(args, cfg: dict, rules: dict) -> int:
-    entries = read_ledger(cfg)
+    try:
+        entries = read_ledger(cfg)
+    except LedgerError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 2
     if args.job:
         job_id = str(load_job(Path(args.job)).get("job_id"))
         entries = [e for e in entries if str(e.get("job_id")) == job_id]
@@ -1216,7 +1571,11 @@ def cmd_resolve(args, cfg: dict, rules: dict) -> int:
     job = load_job(Path(args.job))
     job_id = str(job.get("job_id"))
     target = args.target
-    previous = latest_entry(cfg, job_id, target)
+    try:
+        previous = latest_entry(cfg, job_id, target)
+    except LedgerError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 2
     if not previous:
         print("✗ 账本里没有这条记录", file=sys.stderr)
         return 1
@@ -1256,15 +1615,21 @@ def build_parser() -> argparse.ArgumentParser:
         item = sub.add_parser(name, help=help_text)
         item.add_argument("--job", required=True)
         item.add_argument("--target", default="", help="只检查某个平台：bilibili,douyin")
+        if name == "check":
+            item.add_argument("--deep", action="store_true",
+                              help="额外用 ffmpeg 实测响度，并核对上游 qa 回执（约 28x 实时）")
         item.set_defaults(func=func)
 
     submit = sub.add_parser("submit", help="提交（先跑预检，全过才动手）")
     submit.add_argument("--job", required=True)
     submit.add_argument("--target", default="")
+    submit.add_argument("--deep", action="store_true", help="预检时实测响度")
     submit.add_argument("--yes", action="store_true", help="确认公开投稿（必须显式给）")
     submit.add_argument("--dry-run", action="store_true", help="只打印，不执行")
     submit.add_argument("--force-uncertain", action="store_true",
                         help="上一轮不确定也继续投（默认禁止，会导致重复投稿）")
+    submit.add_argument("--republish", action="store_true",
+                        help="同 job_id 换过素材仍要重投（默认禁止）")
     submit.set_defaults(func=cmd_submit)
 
     status = sub.add_parser("status", help="账本")

@@ -23,23 +23,28 @@ C1 素材可被平台接受（文件/解码/分辨率/画幅/时长/帧率/音�
 【命令表】
 | 命令 | 作用 |
 |---|---|
-| `doctor` | 环境自检：ffprobe / biliup / cookie 有效期 / 抖音登录态 / 账本 |
-| `check --job` | 五道门逐条判定，error 会拦、warn 放行并记录 |
+| `doctor` | 环境自检：ffprobe/ffmpeg/biliup/cookie 有效期/抖音登录态/时区/账本 |
+| `check --job` | 五道门逐条判定，error 会拦、warn 放行并记录；加 `--deep` 会**整段解码**+实测响度（+2~4 秒），能抓出「容器头正常但载荷截断」的坏文件，并核对上游 qa 数字 |
 | `plan --job` | 只打印参数：B 站 biliup argv（含 `--dtime`/`--extra-fields`）、抖音 job.json |
-| `submit --job --yes` | 先跑 check；同一素材已投过直接跳过；三态落账本 |
+| `submit --job --yes` | 先跑 check；同素材已投过直接跳过；单条占位锁防并发双投；三态落账本 |
 | `status` | 账本（job × 平台的最新状态与回执） |
 | `resolve --job --target ... --state submitted|failed --note` | **只给 uncertain 用**：人工核对后台后结案 |
 
+`--target all`（或省略）= 按 job.targets 全投；`--target bilibili` 只投一个平台。
+同一 job_id 换过素材要重投，必须显式加 `--republish`；上一轮 uncertain 要强投加 `--force-uncertain`（默认都拦住）。
+
 【平台差异（规则表 `rules.default.json` 是唯一来源，别在别处再写阈值）】
 - B 站：画幅 16:9 / 1920×1080；`tid=231`、`copyright=1`、`no_reprint=1`；AI 声明走 `--extra-fields {"creation_statement":{"id":1}}`；`--dtime` 必须比现在晚 **>4 小时**，`schedule: "auto"` 会取配置里的时段自动算。
-- 抖音：画幅 9:16 / 1080×1920；标题/简介/话题进 job，`schedule` 形如 `2026-11-02 12:00`；**成功必须 `success && scheduled && ai_declared` 三者同真**（AI 声明是平台硬要求，缺了等于白干）；登录态是持久化 Chrome profile，只有真跑才知道还在不在。
+- 抖音：画幅 9:16 / 1080×1920；标题/简介/话题进 job，`schedule` 形如 `2026-11-02 12:00`，必须落在 **[现在+2h, 现在+14 天]**（平台会静默改期）；**成功必须** 结果 JSON 有 `finished_at` ∧ `success` ∧ `scheduled` ∧ `ai_declared` ∧ body 里出现强证据「作者声明：内容由AI生成」∧ 回执 sha256 与本地一致；登录态是持久化 Chrome profile，只有真跑才知道还在不在。
 
 【失败处置（照这个来，别自作聪明）】
 | 看到 | 做什么 |
 |---|---|
 | `uncertain` | **绝不重投**。去平台后台看有没有该稿件，再用 `resolve` 结案。重复投稿在 B 站会限流、抖音会出现两条同款。 |
 | B 站 601 / 风控 | 停当天批次，明天再传；不要缩短间隔硬刷。 |
-| `failed` 且 exit 2（抖音） | 登录态失效，先人工登录再重跑。 |
+| 抖音结果 JSON 缺 `finished_at` | 进程硬崩（启动即崩/登录失效/profile 被占）：先修环境（只读 `check_login.py` 看 `logged_in`），再决定；**不许直接重跑**。 |
+| 抖音 `sched_value` ≠ 你要的时间 | 平台静默改期了。作品已发，**不要重投**；需要精确时段去创作中心改。 |
+| 抖音退出码 2 | 看 stage：`no_video` 是 failed（视频路径错）、`upload_timeout` 是 uncertain（可能传了一半，先看后台）。**2 不是登录态问题**。 |
 | CER > 0.13 / qa.verdict=fail | 这是上游生产的问题，**不许绕过**：回生产环节重渲，别在这里找开关。 |
 | 标题超限 | 按 check 给的「删 N 字」改，改完重跑 check。 |
 

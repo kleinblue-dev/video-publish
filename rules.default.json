@@ -1,6 +1,25 @@
 {
   "schema": 1,
   "_comment": "视频发布规则表：唯一事实来源。改阈值只改这里，代码里不许再写第二份。source 字段说明该数字的来源，未验证的要写未验证。",
+  "_audit": {
+    "verified_on_this_machine": [
+      "B站：title<=80 / desc<=2000 / tags 1-10 / tid=231 / copyright=1 / no_reprint=1 / dtime>4h —— 见 github-tech-radar/scripts/bilibili_upload.py 预检与 biliup --help 原文",
+      "B站：cookie 需要 SESSDATA+bili_jct+DedeUserID，expires 是 10 位 Unix 秒 —— references/contracts.md §1.7",
+      "B站：BV 在 stdout，aid 写作 Number(...) —— contracts.md §1.3（实测回执）",
+      "抖音：publish_daily.py 把 title 截断到 30 字 —— publish_daily.py:272；定时窗口「2小时后及14天内」为创作页原文 —— contracts.md §2.1",
+      "抖音：成功=finished_at+success+scheduled+ai_declared+强文案；sched_value 必须回读比对 —— contracts.md §2.2/§2.4",
+      "全局：画幅 16:9=1920x1080 / 9:16=1080x1920，30fps —— GTR 07-video.md 与 pixelcat qa.json 实测",
+      "全局：CER 0.11 放行 / 0.13 拦截 —— pixelcat logs/known-issues.md 第 2 条"
+    ],
+    "unverified_on_this_machine": [
+      "B站 title/desc/tags 的平台侧真限（本地预检阈值来自参考脚本，平台真限未实测）",
+      "B站 AI 声明是否真的显示在稿件上（biliup 只保证参数已传）",
+      "抖音标题 55 字平台口径（本地按发布器 30 字截断拦，平台真限未实测）",
+      "抖音 desc 1000 字是否硬限（创作页计数 0/1000，未触发）",
+      "封面最小尺寸 1000x600（B站公开口径 1146x717 未实测），封面比例容差为经验值",
+      "响度区间 [-19,-11] LUFS / 真峰 -1.0 dBTP 为可听性经验带，非平台拒绝阈值"
+    ]
+  },
   "duration": {
     "min": 20,
     "max": 180,
@@ -56,7 +75,7 @@
     },
     "douyin": {
       "formats": ["9:16"],
-      "title_max": 55,
+      "title_max": 30,
       "desc_max": 1000,
       "tags_min": 0,
       "tags_max": 10,
@@ -66,13 +85,16 @@
       "cover_min": [600, 600],
       "cover_aspect": 0.75,
       "cover_aspect_tolerance": 0.6,
-      "min_lead_minutes": 30,
+      "min_lead_minutes": 120,
+      "max_lead_days": 14,
       "schedule_times": ["12:00", "19:00"],
       "require_hashtags": true,
       "source": {
-        "title_max": "抖音创作页作品描述框实测 0/1000（douyin-daily-20261101-1200-result.json progress），标题 55 字为公开口径（未在本机实测拒绝）",
-        "desc_max": "同上 0/1000",
+        "title_max": "发布器把标题截断到 30 字（publish_daily.py:272 title[:30]）；超过 30 会被静默截断，故按 30 拦；平台侧 55 字口径未实测",
+        "desc_max": "创作页作品描述计数实测 /1000（douyin-daily-20261101-1200-result.json progress），未触发拒绝",
         "cover": "douyin-auto 上传竖封面 3:4 与横封面 4:3（publish_daily.py upload_cover）",
+        "min_lead_minutes": "创作页原文「支持2小时后及14天内的定时发布」（contracts.md §2.1 引 body_tail）",
+        "max_lead_days": "同上",
         "require_hashtags": "pixelcat douyin-job.json 的 desc 尾部固定带 #话题"
       }
     }
