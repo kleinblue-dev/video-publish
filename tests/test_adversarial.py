@@ -249,7 +249,7 @@ class TestSecurity(unittest.TestCase):
         with mock.patch.object(publish, "probe", lambda f, p, timeout=60: mapping[str(p)]), \
                 mock.patch.object(publish, "run_process", side_effect=AssertionError("不许启动进程")) as run:
             code = publish.main(["--config", str(self.env.cfg_path), "submit", "--dry-run",
-                                 "--job", str(self.env.job_path)])
+                                 "--skip-deep", "--job", str(self.env.job_path)])
         self.assertEqual(code, 0)
         self.assertFalse(run.called)
         self.assertFalse(self.env.ledger.exists())
@@ -310,7 +310,7 @@ class TestFixedGaps(unittest.TestCase):
                 mock.patch.object(publish, "run_process", side_effect=AssertionError("不许启动")) as run, \
                 contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             code = publish.main(["--config", str(self.env.cfg_path), "submit", "--yes",
-                                 "--job", str(self.env.job_path)])
+                                 "--skip-deep", "--job", str(self.env.job_path)])
         self.assertEqual(code, 0)
         self.assertIn("已提交过，跳过", buf.getvalue())
         self.assertFalse(run.called)
@@ -323,7 +323,7 @@ class TestFixedGaps(unittest.TestCase):
         with mock.patch.object(publish, "probe", lambda f, p, timeout=60: self.env.probe_map()[str(p)]), \
                 contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             code = publish.main(["--config", str(self.env.cfg_path), "submit", "--yes", "--force-uncertain",
-                                 "--dry-run", "--job", str(self.env.job_path)])
+                                 "--dry-run", "--skip-deep", "--job", str(self.env.job_path)])
         self.assertEqual(code, 0)
         self.assertIn("DRY-RUN", buf.getvalue())
 
@@ -478,7 +478,7 @@ class TestConcurrency(unittest.TestCase):
             env.write_files()
 
             argv = [sys.executable, str(PUBLISH_PY), "--config", str(env.cfg_path),
-                    "submit", "--yes", "--job", str(env.job_path)]
+                    "submit", "--yes", "--skip-deep", "--job", str(env.job_path)]
             out_a = Path(tmp) / "a.out"
             out_b = Path(tmp) / "b.out"
             fa = out_a.open("w", encoding="utf-8")

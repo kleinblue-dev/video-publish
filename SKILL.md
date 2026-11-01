@@ -26,7 +26,7 @@ C1 素材可被平台接受（文件/解码/分辨率/画幅/时长/帧率/音�
 | `doctor` | 环境自检：ffprobe/ffmpeg/biliup/cookie 有效期/抖音登录态/时区/账本 |
 | `check --job` | 五道门逐条判定，error 会拦、warn 放行并记录；加 `--deep` 会**整段解码**+实测响度（+2~4 秒），能抓出「容器头正常但载荷截断」的坏文件，并核对上游 qa 数字 |
 | `plan --job` | 只打印参数：B 站 biliup argv（含 `--dtime`/`--extra-fields`）、抖音 job.json |
-| `submit --job --yes` | 先跑 check；同素材已投过直接跳过；单条占位锁防并发双投；三态落账本 |
+| `submit --job --yes` | 先跑 check（**默认强制整段解码 + 实测响度**，约 +4s，可用 `--skip-deep` 跳过）；同素材已投过直接跳过；单条占位锁防并发双投；三态落账本 |
 | `status` | 账本（job × 平台的最新状态与回执） |
 | `resolve --job --target ... --state submitted|failed --note` | **只给 uncertain 用**：人工核对后台后结案 |
 

@@ -57,7 +57,7 @@ python publish.py resolve --job job.json --target bilibili --state submitted --n
 | `doctor` | python / ffprobe / biliup / cookie 有效期 / 抖音登录态 / 账本可写 | 无 |
 | `check` | 五道门逐条判定；`error` 拦截，`warn` 放行并进回执。加 `--deep` 会**整段解码**（抓「容器完好但载荷截断」）+ ffmpeg 实测响度并核对上游 qa | 无（**不碰网络**） |
 | `plan` | 打印 B 站 biliup argv、抖音 job.json、定时换算结果 | 无 |
-| `submit` | 先跑一遍 check，全过才执行；同指纹已 submitted 直接跳过 | 真实投稿 |
+| `submit` | 先跑一遍 check（**默认整段解码 + 实测响度**，`--skip-deep` 可关）；全过才执行；同指纹已 submitted 直接跳过；单条占位锁防并发 | 真实投稿 |
 | `status` | 读 JSONL 账本 | 无 |
 | `resolve` | 人工核对后台后给 `uncertain` 结案 | 只写账本 |
 
@@ -119,6 +119,22 @@ python -m unittest discover -s tests -v
 ```
 
 全部离线：用临时目录造假视频/假 cookie/假账本，执行器调用用 mock 替换，不联网、不做真实投稿。
+共 **72 条**（其中 27 条来自对抗验证），2 条按环境 skip。
+
+## 验证记录（2026-11-01，本机实测）
+
+| 项 | 结果 |
+|---|---|
+| `doctor` | 9 项全 ✓（python/ffprobe/ffmpeg/biliup/cookie 剩 88 天/抖音发布器/抖音登录态/时区/账本） |
+| `check`（真实 15MB 素材，两画幅） | 3 次 **213 / 214 / 227 ms**，0 网络，exit 0 |
+| `check --deep` | **3,676 ms**（两画幅各整段解码 + 实测响度 + 核对上游 qa） |
+| `submit --dry-run` | **3,814 ms**，启动的上传进程数 = 0 |
+| 对抗样本 | 分辨率错 / 无音轨 / 5s 过短 / 截断 mp4 / 标题 90 字 / 封面 300×200 / 未标 AI 声明 / 已投递指纹 —— 全部 error 拦截，exit 1 |
+| 安全 | cookie 9 个原值 × 32 个输出文件扫描：无泄漏；不带 `--yes` 直接拒绝且零进程 |
+| 并发 | 两条 `submit` 同时跑：一条占位成功、另一条被 409 式拒绝（`claim-*.lock`），账本只出现 1 次 submitted |
+| 真实投稿 | **本轮未做**（验证只做离线与只读），`~/.video-publish/ledger.jsonl` 至今为空 |
+
+对抗验证报告（74 KB，含逐条命令与回执）保存在工作区 `video-publish-verify/report.md`，未随仓库发布。
 
 ## 已知边界（诚实清单）
 

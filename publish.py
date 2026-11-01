@@ -511,13 +511,14 @@ def check_auth_bilibili(cfg: dict, rules: dict) -> list[dict]:
         if deadline < now():
             return [check("auth.bilibili.cookies", "error",
                           f"cookie 已过期：{deadline:%Y-%m-%d %H:%M}", "bilibili")]
+        warn_days = int((rules.get("tolerances") or {}).get("cookie_warn_days") or 3)
         remaining = (deadline - now()).days
-        return [check("auth.bilibili.cookies", "warn" if remaining < 3 else "info",
+        return [check("auth.bilibili.cookies", "warn" if remaining < warn_days else "info",
                       f"cookie 有效至 {deadline:%Y-%m-%d}（剩 {remaining} 天）", "bilibili")]
     return [check("auth.bilibili.cookies", "warn", "cookie 没有 expires，无法判断过期", "bilibili")]
 
 
-def check_auth_douyin(cfg: dict) -> list[dict]:
+def check_auth_douyin(cfg: dict, rules: dict) -> list[dict]:
     profile = Path(str(cfg_get(cfg, "douyin.profile_dir", "") or ""))
     publisher = Path(str(cfg_get(cfg, "tools.douyin_publisher", "") or ""))
     items = []
@@ -536,10 +537,11 @@ def check_auth_douyin(cfg: dict) -> list[dict]:
             newest = max(path.stat().st_mtime for path in markers)
             age_days = (time.time() - newest) / 86400
             deadline = datetime.fromtimestamp(newest, TZ) if TZ else datetime.fromtimestamp(newest)
+            warn_days = int((rules.get("tolerances") or {}).get("profile_warn_days") or 14)
             detail = f"登录 cookie 在（更新于 {deadline:%Y-%m-%d}）"
             items.append(check("auth.douyin.profile",
-                               "warn" if age_days > 14 else "info",
-                               detail + ("，超过 14 天没更新，跑之前先确认还能登录" if age_days > 14 else ""),
+                               "warn" if age_days > warn_days else "info",
+                               detail + (f"，超过 {warn_days} 天没更新，跑之前先确认还能登录" if age_days > warn_days else ""),
                                "douyin"))
     return items
 
@@ -583,9 +585,14 @@ def check_platform_assets(job: dict, target: str, rules: dict, probes: dict) -> 
     expected = (rules.get("formats") or {}).get(expected_fmt) or {}
     if expected:
         want_w, want_h = int(expected["width"]), int(expected["height"])
-        if (info["width"], info["height"]) != (want_w, want_h):
+        tolerance = int((rules.get("tolerances") or {}).get("dimension_px") or 0)
+        off = max(abs(info["width"] - want_w), abs(info["height"] - want_h))
+        if off > tolerance:
             add("video.dimension", "error",
-                f"分辨率 {info['width']}x{info['height']} ≠ 规则 {want_w}x{want_h}（{expected_fmt}）")
+                f"分辨率 {info['width']}x{info['height']} ≠ 规则 {want_w}x{want_h}（{expected_fmt}，容差 {tolerance}px）")
+        elif off:
+            add("video.dimension", "warn",
+                f"分辨率 {info['width']}x{info['height']} 与规则 {want_w}x{want_h} 差 {off}px（容差内）")
         else:
             add("video.dimension", "info", f"{expected_fmt} 分辨率正确")
     fps_rules = rules.get("fps") or {}
@@ -810,7 +817,7 @@ def check_deep_audio(job: dict, cfg: dict, rules: dict) -> list[dict]:
     if not videos:
         return [check("audio.measured", "warn", "深检跳过：没有可读视频")]
     items = []
-    measured_first = None
+    measured_by_target: list[tuple[str, dict]] = []
     for target, video in videos:
         ok, error = decode_check(ffmpeg, video)
         if ok:
@@ -825,11 +832,24 @@ def check_deep_audio(job: dict, cfg: dict, rules: dict) -> list[dict]:
         items.append(check("audio.measured", "info",
                            f"[{target}] 实测 {measured['lufs']:.2f} LUFS / {measured['tp']:.2f} dBTP / "
                            f"LRA {measured['lra']:.1f} LU", target))
-        if measured_first is None:
-            measured_first = measured
-    if measured_first is not None:
-        qa = job.get("qa") or {}
-        for key, tolerance in (("lufs", 1.0), ("tp", 0.6)):
+        measured_by_target.append((target, measured))
+
+    # 证据核对：job.qa 可以是整份（算主画幅 = job.targets 第一个），也可以 job.qa[平台] 分开给。
+    qa_all = job.get("qa") or {}
+    tolerances = rules.get("tolerances") or {}
+    primary = job["targets"][0] if job.get("targets") else ""
+    for target, measured in measured_by_target:
+        per_target = qa_all.get(target)
+        if isinstance(per_target, dict):
+            qa, scope = per_target, target
+        elif target == primary:
+            qa, scope = qa_all, primary
+        else:
+            items.append(check("audio.evidence", "info",
+                               f"[{target}] 上游没有该画幅的 qa 回执，未核对（要核对应在 job.qa 里按平台分开给）",
+                               target))
+            continue
+        for key, tolerance_key in (("lufs", "lufs_db"), ("tp", "tp_db")):
             claimed = qa.get(key)
             if claimed is None:
                 continue
@@ -837,14 +857,15 @@ def check_deep_audio(job: dict, cfg: dict, rules: dict) -> list[dict]:
                 claimed = float(claimed)
             except (TypeError, ValueError):
                 continue
-            actual = measured_first[key]
+            tolerance = float(tolerances.get(tolerance_key) or (1.0 if key == "lufs" else 0.6))
+            actual = measured[key]
             if abs(claimed - actual) > tolerance:
                 items.append(check("audio.evidence", "warn",
-                                   f"上游 qa.{key}={claimed:g} 与实测 {actual:g} 相差 "
-                                   f"{abs(claimed - actual):.2f}（>{tolerance}），qa 回执可能不准"))
+                                   f"[{scope}] 上游 qa.{key}={claimed:g} 与实测 {actual:g} 相差 "
+                                   f"{abs(claimed - actual):.2f}（>{tolerance}），qa 回执可能不准", target))
             else:
                 items.append(check("audio.evidence", "info",
-                                   f"上游 qa.{key} 与实测一致（差 {abs(claimed - actual):.2f}）"))
+                                   f"[{scope}] 上游 qa.{key} 与实测一致（差 {abs(claimed - actual):.2f}）", target))
     return items
 
 
@@ -1178,7 +1199,7 @@ def run_checks(job: dict, cfg: dict, rules: dict, deep: bool = False) -> list[di
         items.extend(check_deep_audio(job, cfg, rules))
     for target in targets:
         items.extend(check_tools(cfg, target, rules))
-        items.extend(check_auth_bilibili(cfg, rules) if target == "bilibili" else check_auth_douyin(cfg))
+        items.extend(check_auth_bilibili(cfg, rules) if target == "bilibili" else check_auth_douyin(cfg, rules))
         items.extend(check_platform_assets(job, target, rules, probes))
         items.extend(check_platform_text(job, target, rules))
         items.extend(check_platform_cover(job, target, rules))
@@ -1465,8 +1486,11 @@ def cmd_submit(args, cfg: dict, rules: dict) -> int:
     if not targets:
         print("✗ job.targets 里没有已支持的平台", file=sys.stderr)
         return 1
+    # submit 是「不可逆动作前的最后一道门」：默认强制 --deep（整段解码 + 实测响度，约 +4s），
+    # 因为容器头正常但载荷截断的坏文件只有真解码才暴露（对抗验证 D1）。
+    deep = not getattr(args, "skip_deep", False)
     try:
-        items = run_checks(job, cfg, rules, deep=args.deep)
+        items = run_checks(job, cfg, rules, deep=deep)
     except LedgerError as exc:
         print(f"✗ {exc}", file=sys.stderr)
         return 2
@@ -1623,7 +1647,9 @@ def build_parser() -> argparse.ArgumentParser:
     submit = sub.add_parser("submit", help="提交（先跑预检，全过才动手）")
     submit.add_argument("--job", required=True)
     submit.add_argument("--target", default="")
-    submit.add_argument("--deep", action="store_true", help="预检时实测响度")
+    submit.add_argument("--deep", action="store_true", help="预检时实测响度（submit 默认已开启，此开关保留兼容）")
+    submit.add_argument("--skip-deep", action="store_true",
+                        help="跳过整段解码/响度实测（只在确认媒体完好时用，会放过载荷截断的坏文件）")
     submit.add_argument("--yes", action="store_true", help="确认公开投稿（必须显式给）")
     submit.add_argument("--dry-run", action="store_true", help="只打印，不执行")
     submit.add_argument("--force-uncertain", action="store_true",

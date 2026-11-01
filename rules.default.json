@@ -20,16 +20,24 @@
       "响度区间 [-19,-11] LUFS / 真峰 -1.0 dBTP 为可听性经验带，非平台拒绝阈值"
     ]
   },
+  "tolerances": {
+    "dimension_px": 4,
+    "lufs_db": 1.0,
+    "tp_db": 0.6,
+    "cookie_warn_days": 3,
+    "profile_warn_days": 14,
+    "source": "容差为工程经验值（未验证平台真限）：分辨率差 <=4px 只告警；qa 数字与实测差 >1.0 LUFS / 0.6 dBTP 判回执不准"
+  },
   "duration": {
-    "min": 20,
+    "min": 30,
     "max": 180,
     "preferred": [44, 56],
-    "source": "GTR 07-video.md 上传前 ffprobe 校验 30-180s；pixelcat qa 门禁实测 44-56s（logs/known-issues.md 第 2 条）"
+    "source": "GTR 07-video.md 上传前 ffprobe 校验 30-180s（已验证）；pixelcat qa 目标区 44-56s（logs/known-issues.md 第 2 条，实测）"
   },
   "fps": {
     "min": 24,
     "max": 60,
-    "source": "B 站/抖音均接受 24-60；本机产出 30（GTR 07-video.md）"
+    "source": "B 站/抖音接受范围（未验证平台真限）；本机产出固定 30fps（GTR 07-video.md 实测）"
   },
   "audio": {
     "lufs_range": [-19, -11],
@@ -70,7 +78,11 @@
         "tags": "同上 1-10 个；tag 单项长度按 B 站常规 20 字（未在本机实测）",
         "dtime": "同上：next_slots 要求候选时间 <= now+4h5m 时跳过；biliup --dtime 说明「距离提交大于4小时」",
         "tid": "同上 tid 必须 231（科技/计算机技术）",
-        "cover": "cover.jpg 由 GTR 产出 16:9；B 站封面最小 1146x717 为公开口径，本机按 1000x600 兜底校验（未实测拒绝阈值）"
+        "cover": "cover.jpg 由 GTR 产出 16:9；B 站封面最小 1146x717 为公开口径，本机按 1000x600 兜底校验（未实测拒绝阈值）",
+        "max_video_bytes": "8GB 为估计值，未验证平台单文件上限",
+        "cover_aspect": "16:9 为平台推荐比例（未验证强制），±0.25 容差为经验值",
+        "schedule_times": "定时时段是运营策略（非平台限制），按需改",
+        "submit": "client 在 biliup 0.2.4 已失效会自动回退 APP（实测 WARN）；保持 client 是因为两次真实投稿都成功"
       }
     },
     "douyin": {
@@ -95,7 +107,11 @@
         "cover": "douyin-auto 上传竖封面 3:4 与横封面 4:3（publish_daily.py upload_cover）",
         "min_lead_minutes": "创作页原文「支持2小时后及14天内的定时发布」（contracts.md §2.1 引 body_tail）",
         "max_lead_days": "同上",
-        "require_hashtags": "pixelcat douyin-job.json 的 desc 尾部固定带 #话题"
+        "require_hashtags": "pixelcat douyin-job.json 的 desc 尾部固定带 #话题",
+        "max_video_bytes": "4GB 为估计值，未验证平台单文件上限",
+        "cover_aspect": "竖封面 3:4（0.75）/ 横封面 4:3（1.333）为创作页两种上传位，容差 0.6 为经验值",
+        "schedule_times": "定时时段是运营策略（非平台限制），按需改",
+        "formats": "9:16 / 1080x1920 为本机产出规格（pixelcat qa.json 实测）"
       }
     }
   }

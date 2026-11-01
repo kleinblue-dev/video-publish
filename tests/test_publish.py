@@ -418,8 +418,8 @@ class TestSubmitFlow(unittest.TestCase):
         self._tmp.cleanup()
 
     def args(self, **overrides):
-        base = dict(job=str(self.job_path), target="bilibili", deep=False, json=False, verbose=False,
-                    yes=True, dry_run=True, force_uncertain=False, republish=False,
+        base = dict(job=str(self.job_path), target="bilibili", deep=False, skip_deep=True, json=False,
+                    verbose=False, yes=True, dry_run=True, force_uncertain=False, republish=False,
                     config="", command="submit")
         base.update(overrides)
         return argparse.Namespace(**base)
@@ -489,6 +489,21 @@ class TestSubmitFlow(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("DRY-RUN", out)
         self.assertFalse(called)
+
+    def test_submit_defaults_to_deep_decode(self):
+        """不可逆动作前默认整段解码：载荷截断（容器头正常）必须在 submit 阶段被拦。"""
+        mapping = self.env.probe_map()
+        args = self.args(skip_deep=False, dry_run=True)
+        calls = []
+        with mock.patch.object(publish, "probe", lambda f, p, timeout=60: mapping.get(str(p), (None, "x"))), \
+                mock.patch.object(publish, "decode_check",
+                                  lambda ffmpeg, path, timeout=900: (calls.append(path) or (False, "Invalid NAL unit size"))), \
+                mock.patch.object(publish, "measure_loudness",
+                                  lambda ffmpeg, path, timeout=600: ({"lufs": -14.0, "tp": -2.0, "lra": 5.0}, "")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = publish.cmd_submit(args, self.env.cfg, self.env.rules)
+        self.assertEqual(code, 1)
+        self.assertTrue(calls, "submit 必须真的整段解码")
 
 
 class TestLedger(unittest.TestCase):
